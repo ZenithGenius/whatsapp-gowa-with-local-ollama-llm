@@ -9,6 +9,8 @@ main.exe
 src/pkged.go
 storages
 .env
+.history/
+venv/
 bin
 .playwright-mcp
 .cursor/mcp.json
