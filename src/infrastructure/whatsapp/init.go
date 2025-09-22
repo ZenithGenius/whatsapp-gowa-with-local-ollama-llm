@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/mcp"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
@@ -532,87 +534,46 @@ func handleAutoMarkRead(_ context.Context, evt *events.Message) {
 }
 
 func handleAutoReply(ctx context.Context, evt *events.Message, chatStorageRepo domainChatStorage.IChatStorageRepository) {
-	if config.WhatsappAutoReplyMessage == "" {
-		return
-	}
-
-	// Skip groups, broadcasts, and self messages
+	// Only process incoming text messages (not from us, not broadcasts, not groups)
 	if utils.IsGroupJID(evt.Info.Chat.String()) || evt.Info.IsIncomingBroadcast() || evt.Info.IsFromMe {
 		return
 	}
 
-	// Only reply to direct 1:1 chats (e.g., *@s.whatsapp.net)
-	if evt.Info.Chat.Server != types.DefaultUserServer {
-		return
-	}
-
-	// Extra safety: skip any broadcast/status contexts
-	source := evt.Info.SourceString()
-	if strings.Contains(source, "broadcast") ||
-		strings.HasSuffix(evt.Info.Chat.String(), "@broadcast") ||
-		strings.HasPrefix(evt.Info.Chat.String(), "status@") {
-		return
-	}
-
-	// Require actual typed text (not captions or synthetic labels)
-	hasText := false
-
-	// Unwrap FutureProof wrappers to access the inner message content first
-	innerMsg := evt.Message
-	for i := 0; i < 3; i++ { // safeguard against excessively nested wrappers
-		if vm := innerMsg.GetViewOnceMessage(); vm != nil && vm.GetMessage() != nil {
-			innerMsg = vm.GetMessage()
-			continue
-		}
-		if em := innerMsg.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
-			innerMsg = em.GetMessage()
-			continue
-		}
-		if vm2 := innerMsg.GetViewOnceMessageV2(); vm2 != nil && vm2.GetMessage() != nil {
-			innerMsg = vm2.GetMessage()
-			continue
-		}
-		if vm2e := innerMsg.GetViewOnceMessageV2Extension(); vm2e != nil && vm2e.GetMessage() != nil {
-			innerMsg = vm2e.GetMessage()
-			continue
-		}
-		break
-	}
-
-	// Check for genuine typed text on the unwrapped content
-	if conv := innerMsg.GetConversation(); conv != "" {
-		hasText = true
-	} else if ext := innerMsg.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
-		hasText = true
-	} else if protoMsg := innerMsg.GetProtocolMessage(); protoMsg != nil {
-		if edited := protoMsg.GetEditedMessage(); edited != nil {
-			if ext := edited.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
-				hasText = true
-			} else if conv := edited.GetConversation(); conv != "" {
-				hasText = true
-			}
-		}
-	}
-	if !hasText {
-		return
+	// Check if the incoming message has text content
+	messageText := utils.ExtractMessageTextFromEvent(evt)
+	if strings.TrimSpace(messageText) == "" {
+		return // Don't auto-reply to non-text messages
 	}
 
 	// Format recipient JID
 	recipientJID := utils.FormatJID(evt.Info.Sender.String())
+	// Format recipient JID
+	recipientJID := utils.FormatJID(evt.Info.Sender.String())
 
-	// Send the auto-reply message
-	response, err := cli.SendMessage(
-		ctx,
-		recipientJID,
-		&waE2E.Message{Conversation: proto.String(config.WhatsappAutoReplyMessage)},
-	)
+	// Log the incoming message details (sane level)
+	log.Infof("[AI] incoming id=%s chat=%s sender=%s text=%q", evt.Info.ID, evt.Info.Chat.String(), evt.Info.Sender.String(), messageText)
 
+	// Call AI service (with normalization + shouldReply)
+	aiText, shouldReply, err := getAIResponse(ctx, evt, messageText)
 	if err != nil {
-		log.Errorf("Failed to send auto-reply message: %v", err)
+		log.Errorf("[AI] service error for msg %s: %v", evt.Info.ID, err)
 		return
 	}
 
-	// Store the auto-reply message in chat storage if send was successful
+	aiText = strings.TrimSpace(aiText)
+	if aiText == "" || !shouldReply {
+		log.Warnf("[AI] skipping send (empty or shouldReply=false) for msg %s", evt.Info.ID)
+		return
+	}
+
+	// Send the response message
+	response, err := cli.SendMessage(ctx, recipientJID, &waE2E.Message{Conversation: proto.String(aiText)})
+	if err != nil {
+		log.Errorf("Failed to send AI response message: %v", err)
+		return
+	}
+
+	// Store the response message in chat storage if send was successful
 	if chatStorageRepo != nil {
 		// Get our own JID as sender
 		senderJID := ""
@@ -620,21 +581,151 @@ func handleAutoReply(ctx context.Context, evt *events.Message, chatStorageRepo d
 			senderJID = cli.Store.ID.String()
 		}
 
-		// Store the sent auto-reply message
 		if err := chatStorageRepo.StoreSentMessageWithContext(
 			ctx,
-			response.ID,                     // Message ID from WhatsApp response
-			senderJID,                       // Our JID as sender
-			recipientJID.String(),           // Recipient JID
-			config.WhatsappAutoReplyMessage, // Auto-reply content
-			response.Timestamp,              // Timestamp from response
+			response.ID,           // Message ID from WhatsApp response
+			senderJID,             // Our JID as sender
+			recipientJID.String(), // Recipient JID
+			aiText,                // AI response content
+			response.Timestamp,    // Timestamp from response
 		); err != nil {
-			// Log storage error but don't fail the auto-reply
-			log.Errorf("Failed to store auto-reply message in chat storage: %v", err)
+			log.Errorf("Failed to store AI response message in chat storage: %v", err)
 		} else {
-			log.Debugf("Auto-reply message %s stored successfully in chat storage", response.ID)
+			log.Debugf("AI response message %s stored successfully in chat storage", response.ID)
 		}
 	}
+}
+
+// normalizeAIText cleans common model wrappers (JSON string literals, code fences)
+func normalizeAIText(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
+	if s == "" {
+		return s
+	}
+	// Unquote JSON string literal: "hello" -> hello ; "" -> ""
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		if unq, err := strconv.Unquote(s); err == nil {
+			s = strings.TrimSpace(unq)
+		}
+	}
+	// Strip simple triple backtick fences
+	if strings.HasPrefix(s, "```") {
+		// remove opening fence (with optional language)
+		s = strings.TrimPrefix(s, "```")
+		if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+			s = s[idx+1:]
+		}
+		// remove trailing fence if present
+		if idx := strings.LastIndex(s, "```"); idx >= 0 {
+			s = s[:idx]
+		}
+		s = strings.TrimSpace(s)
+	}
+	if s == "\"\"" { // edge case: literal "" inside a string
+		s = ""
+	}
+	return s
+}
+
+// getAIResponse asks the AI service; returns (text, shouldReply, error)
+func getAIResponse(parentCtx context.Context, evt *events.Message, messageText string) (string, bool, error) {
+	log.Infof("=== getAIResponse START ===")
+
+	// Get AI service URL from environment variable
+	aiServiceURL := os.Getenv("AI_SERVICE_URL")
+	if aiServiceURL == "" {
+		aiServiceURL = "http://localhost:8000" // fallback for local development
+	}
+	log.Infof("AI Service URL: %s", aiServiceURL)
+
+	// Create AI bridge with generous timeout for slow models (but still cancelable)
+	aiBridge := mcp.NewAIBridge(aiServiceURL, 300*time.Second, logrus.StandardLogger())
+	log.Infof("AI Bridge created successfully")
+
+	// Build payload
+	msg := mcp.Message{
+		ID:        evt.Info.ID,
+		Text:      messageText,
+		SenderID:  evt.Info.Sender.User,
+		ChatID:    evt.Info.Chat.User,
+		Timestamp: evt.Info.Timestamp,
+		Type:      "text",
+		IsGroup:   false,
+		Metadata:  make(map[string]interface{}),
+	}
+	log.Infof("Message created: %+v", msg)
+
+	conv := mcp.Conversation{
+		ChatID:           evt.Info.Chat.User,
+		Messages:         []mcp.Message{msg},
+		LastUpdated:      evt.Info.Timestamp,
+		Context:          "",
+		IsGroup:          false,
+		Participants:     []string{evt.Info.Sender.User},
+		AIEnabled:        true,
+		MaxContextLength: 50,
+	}
+	log.Infof("Conversation created: %+v", conv)
+
+	req := mcp.AIRequest{Message: msg, Conversation: conv}
+	log.Infof("AI Request prepared: %+v", req)
+
+	// Invoke with a bounded context (defensive)
+	ctx, cancel := context.WithTimeout(parentCtx, 310*time.Second)
+	defer cancel()
+
+	var (
+		resp *mcp.AIResponseEnvelope // assuming your bridge returns an envelope with Success/AIResponse
+		err  error
+	)
+
+	// light retry on transient network issues
+	for attempt := 1; attempt <= 2; attempt++ {
+		log.Infof("Sending request to AI service (attempt %d)...", attempt)
+		resp, err = aiBridge.SendAIRequest(ctx, req)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break // canceled or deadline
+		}
+		log.Warnf("AI request attempt %d failed: %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+	if err != nil {
+		log.Errorf("=== AI SERVICE REQUEST FAILED ===")
+		log.Errorf("Error: %v", err)
+		log.Errorf("================================")
+		return "", false, fmt.Errorf("failed to get AI response: %w", err)
+	}
+
+	log.Infof("AI service request completed successfully")
+	log.Infof("=== AI SERVICE RESPONSE ===")
+	log.Infof("Response object: %+v", resp)
+	if !resp.Success {
+		log.Errorf("=== AI PROCESSING FAILED ===")
+		log.Errorf("Success: %t", resp.Success)
+		log.Errorf("Error: %s", resp.Error)
+		log.Errorf("==========================")
+		return "", false, fmt.Errorf("AI processing failed: %s", resp.Error)
+	}
+	if resp.AIResponse == nil {
+		log.Errorf("=== AI RESPONSE IS NIL ===")
+		log.Errorf("Response object: %+v", resp)
+		log.Errorf("========================")
+		return "", false, fmt.Errorf("AI response is nil")
+	}
+
+	raw := resp.AIResponse.Text
+	norm := normalizeAIText(raw)
+	should := resp.AIResponse.ShouldReply
+
+	log.Infof("=== FINAL AI RESPONSE ===")
+	log.Infof("Text: '%s' (rawLen=%d, normLen=%d)", norm, len(raw), len(norm))
+	log.Infof("ShouldReply: %t Confidence: %f", should, resp.AIResponse.Confidence)
+	log.Infof("========================")
+
+	return norm, should, nil
 }
 
 func handleWebhookForward(ctx context.Context, evt *events.Message) {
@@ -648,8 +739,7 @@ func handleWebhookForward(ctx context.Context, evt *events.Message) {
 		}
 	}
 
-	if len(config.WhatsappWebhook) > 0 &&
-		!strings.Contains(evt.Info.SourceString(), "broadcast") {
+	if len(config.WhatsappWebhook) > 0 && !strings.Contains(evt.Info.SourceString(), "broadcast") {
 		go func(evt *events.Message) {
 			if err := forwardMessageToWebhook(ctx, evt); err != nil {
 				logrus.Error("Failed forward to webhook: ", err)
